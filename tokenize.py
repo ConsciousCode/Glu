@@ -4,7 +4,7 @@ import string
 IDENT_STARTCHARS=string.ascii_letters+"$_";
 IDENT_CHARS=IDENT_STARTCHARS+string.digits
 
-binary={"+","-","*","/"}
+binary={"+","-","*","/","="}
 miscops={"(",")",";","{","}"}
 
 class Token:

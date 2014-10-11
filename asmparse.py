@@ -6,100 +6,18 @@ from parsebase import *
 VARCHARS=string.ascii_letters+string.digits+"_$-"
 OPCHARS=string.ascii_letters
 
-class Context:
-	'''
-	Context for how the assembly codes are flattened.
-	'''
-	def __init__(self,consts,labels):
-		self.consts=consts
-		self.labels=labels
-
-class Arg:
-	'''
-	Glu assembly compiler helper used to represent opcode arguments while
-	register ids are still uncertain.
-	'''
-	def __init__(self,id):
-		#+1 because 0 is the "null register"
-		self.id=id+1
-	
-	def __repr__(self):
-		return "@{}".format(self.id)
-
-class Null(Arg):
-	'''
-	Used to represent the null register, a special-case "register" which tells
-	the compiler to either throw away an opcode's result or fill in extra
-	arguments for unary or nullary opcodes.
-	'''
-	def __init__(self):
-		Arg.__init__(self,0)
-	
-	def flatten(self,context):
-		return 0
-	
-	def __repr__(self):
-		return "null"
-
-class Var(Arg):
-	'''
-	Represents a variable register.
-	'''
-	def flatten(self,context):
-		return len(context.consts)+self.id
-
-class Const(Arg):
-	'''
-	Represents a reference to a constant in the constant table.
-	'''
-	def flatten(self,context):
-		return self.id
-
-class Label:
-	'''
-	Represents a label, which is looked up on compile time.
-	'''
-	def __init__(self,name):
-		self.name=name
-	
-	def __repr__(self):
-		return "#{}".format(self.name)
-	
-	def flatten(self,context):
-		return context.labels[self.name]+1
-
-class Opcode:
-	'''
-	The actual opcode.
-	'''
-	def __init__(self,op,dst,args):
-		self.op=op
-		self.dst=dst
-		self.args=args
-	
-	def flatten(self,consts):
-		return code.Opcode(
-			self.dst.flatten(consts),self.op,
-			[x.flatten(consts) for x in self.args]
-		)
-	
-	def __repr__(self):
-		return "({} {})".format(
-			self.op,' '.join(repr(x) for x in self.args)
-		)
-
 def _numlike(c):
 	return c.isdigit() or c=='.'
 
 class Parser(ParserBase):
 	def __init__(self,s=""):
 		ParserBase.__init__(self,s)
-		self.vars=[]
-		self.consts=[]
-		self.labels={}#name:const id
-		self.pc=0
+		self.vars={} #name:graph node
+		self.consts={} #const:number node
+		self.block=None
+		self.entry=None
 	
-	def parse_var(self,val=True):
+	def parse_var(self):
 		if not self.maybe("%"):
 			return None
 		
@@ -109,19 +27,8 @@ class Parser(ParserBase):
 		
 		self.col+=self.pos-start
 		name=self.text[start:self.pos]
-		try:
-			if val:
-				return Var(self.vars.index(name))
-			if self.vars.index(name):
-				raise ParseError("Glu asm uses SSA",self.line,self.col)
-			return Var(self.vars.index(name))
-		except ValueError:
-			if val:
-				raise ParseError(
-					"Using unassigned register",self.line,self.col
-				)
-			self.vars.append(name)
-			return Var(len(self.vars)-1)
+		
+		return name
 	
 	def parse_labelvar(self):
 		if not self.maybe("#"):
@@ -136,7 +43,7 @@ class Parser(ParserBase):
 		if not name:
 			return None
 		
-		return Label(name)
+		return name
 	
 	def parse_const(self):
 		start=self.pos
@@ -152,57 +59,47 @@ class Parser(ParserBase):
 				val=float(num)
 			
 			try:
-				return Const(self.consts.index(val))
-			except ValueError:
-				self.consts.append(val)
-				return Const(len(self.consts)-1)
+				return self.consts[val]
+			except KeyError:
+				n=NumberNode(val)
+				self.consts[val]=n
+				return n
 		
 		return None
 	
 	def parse_val(self):
 		var=self.parse_var()
-		if var:
-			return var
+		if var is not None:
+			return self.vars[var]
 		
 		const=self.parse_const()
-		if const:
+		if const is not None:
 			return const
 		
 		label=self.parse_labelvar()
 		if label:
-			return label
-		
-		x=self.pos
-		while self.pos<len(self.text) and self.text[self.pos] in OPCHARS:
-			self.pos+=1
-			self.col+=1
-		
-		if self.text[x:self.pos]=="null":
-			return Null()
+			return self.vars[label]
 		
 		return None
 	
 	def parse_label(self):
 		before=self.text[self.pos:]
 		label=self.parse_labelvar()
-		if label:
+		if label is not None:
 			if not self.maybe(":"):
 				raise ParseError(
 					"Label declarations require a colon.",self.line,self.col
 				)
-			if label.name in self.labels:
-				raise ParseError(
-					'Redeclaration of label "{}"'.format(label.name),
-					self.line,self.col
-				)
 			
-			self.consts.append(code.Label(self.pc))
-			self.labels[label.name]=len(self.consts)-1
-			return label
+			block=self.vars[label]=code.block()
+			self.block.add(code.goto(block))
+			self.block=block
+			
+			return True
 		
-		return None
+		return False
 	
-	def parse_expr(self,dst=Null()):
+	def parse_expr(self):
 		start=self.pos
 		while self.pos<len(self.text) and self.text[self.pos] in OPCHARS:
 			self.pos+=1
@@ -231,48 +128,45 @@ class Parser(ParserBase):
 			else:
 				raise ParseError("Expected value",self.line,self.col)
 		
-		self.pc+=1
-		
-		return Opcode(name,dst,args)
+		return code.do(name,*args)
 	
 	def parse_assign(self):
-		var=self.parse_var(False)
+		var=self.parse_var()
 		if var is None:
-			return None
+			return False
+		if var in self.vars:
+			raise ParseError(
+				"Redeclaration of register {}".format(var),self.line,self.col
+			)
 		
 		self.space()
 		if not self.maybe('='):
 			raise ParseError("Expected =",self.line,self.col)
 		self.space()
 		
-		expr=self.parse_expr(var)
+		self.vars[var]=self.parse_expr()
 		
-		return expr
+		return True
 	
 	def parse(self,s):
 		self.__init__(s)
-		c=[]
+		self.block=code.block()
+		self.entry=self.block
 		
 		assign=True
-		var=True
+		expr=None
 		label=True
-		while assign or var or label:
+		while assign or expr or label:
 			self.space()
 			assign=self.parse_assign()
-			if assign:
-				c.append(assign)
 			
 			self.space()
-			var=self.parse_expr()
-			if var:
-				c.append(var)
+			expr=self.parse_expr()
 			
 			self.space()
 			label=self.parse_label()
-		context=Context(self.consts,self.labels)
-		c=[x.flatten(context) for x in c]
 		
-		return code.Code(c,self.consts)
+		return code.Code(self.entry,self.consts)
 
 def parse(s):
 	return Parser().parse(s)
